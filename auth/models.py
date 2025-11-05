@@ -12,7 +12,6 @@ class User(Base):
     username: str = Column(String, unique=True, index=True, nullable=False)
     email: str = Column(String, unique=True, index=True, nullable=False)
     password_hash: str = Column(String, nullable=False)
-    subscription_level: str = Column(String, default="free")
     date_of_birth: datetime = Column(Date, nullable=False)
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
     role: str = Column(String, nullable=False, default="user")

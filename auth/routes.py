@@ -9,6 +9,7 @@ from auth.schemas import UserCreate, UserResponse, UserLogin, Token
 from auth.models import User
 from config import settings
 from database import get_db
+from subscription.models import Subscription
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -63,7 +64,31 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 @router.get("/me", response_model=UserResponse)
-def read_users_me(current_user: User = Depends(get_current_user)):
-    """Get current user details."""
-    return current_user
+def read_users_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get current user details with the active subscription level."""
+
+    # Ищем САМУЮ СВЕЖУЮ подписку (по expiry_date DESC)
+    latest_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id
+    ).order_by(Subscription.expiry_date.desc()).first()
+
+    # Активная подписка — только если не истекла
+    latest_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id
+    ).order_by(Subscription.expiry_date.desc()).first()
+
+    subscription_level = latest_sub.level if latest_sub else None
+    subscription_expires_at = latest_sub.expiry_date if latest_sub else None
+
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "date_of_birth": current_user.date_of_birth,
+        "created_at": current_user.created_at,
+        "role": current_user.role,
+        "subscription_level": subscription_level,  # null если нет активной
+        "subscription_expires_at": subscription_expires_at  # всегда последняя
+    }

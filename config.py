@@ -4,10 +4,13 @@ from typing import Dict
     
 class Settings:
     """Application configuration settings."""
-    DATABASE_URL: str = "postgresql+psycopg2://postgres:1234@localhost:5433/mydb2"
+    DATABASE_URL: str = "postgresql+psycopg2://postgres:1234@localhost:5432/mydb"
     SECRET_KEY: str = "your-secret-key-for-jwt"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+
+    CDN_URL = "https://cdn.alinanightsky.com"
+    GCORE_S3_DOMAIN = "s-ed1.cloud.gcore.lu"
 
     # GCore settings
     GCORE_BUCKET_NAME: str = "alinanightsky-website"

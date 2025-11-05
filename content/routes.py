@@ -1,4 +1,6 @@
 # src/content/routes.py
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List
@@ -9,6 +11,7 @@ from auth.routes import get_current_user
 from database import get_db
 from auth.models import User
 from typing import Optional
+from subscription.models import Subscription
 
 router = APIRouter(prefix="/content", tags=["content"])
 
@@ -22,7 +25,7 @@ def check_admin_role(current_user: User = Depends(get_current_user)) -> User:
 async def create_post(
     file: UploadFile = File(...),
     media_type: str = "image",
-    content_type: str = "basic",
+    content_type: str = "fresh",
     description: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(check_admin_role)
@@ -81,14 +84,38 @@ async def toggle_post_visibility(
         raise HTTPException(status_code=404, detail="Post not found")
     return post
 
+
 @router.get("/posts", response_model=List[PostResponse])
 async def get_posts(
-    user_id: Optional[int] = None,
-    content_type: Optional[str] = None,
-    media_type: Optional[str] = None,
-    db: Session = Depends(get_db)
+        user_id: Optional[int] = None,
+        content_type: Optional[str] = None,
+        media_type: Optional[str] = None,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
 ) -> List[PostResponse]:
-    """Retrieve posts with optional filters."""
+    """Retrieve posts with subscription-based access."""
+    print(current_user.role)
+
+    # АДМИН ВИДИТ ВСЁ — БЕЗ ПРОВЕРОК
+    if current_user.role == "admin":
+        return PostService.get_posts(user_id, content_type, media_type, db)
+
+    # ДЛЯ НЕ-АДМИНОВ — ПРОВЕРКА ПОДПИСКИ
+    active_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id,
+        Subscription.expiry_date > datetime.utcnow().date()
+    ).first()
+
+    user_level = active_sub.level if active_sub else None
+
+    if not user_level:
+        raise HTTPException(status_code=403, detail="No active subscription")
+
+    if content_type == "archive" and user_level not in ["pro", "premium"]:
+        raise HTTPException(status_code=403, detail="Upgrade to Pro or Premium")
+    if content_type == "hard" and user_level != "premium":
+        raise HTTPException(status_code=403, detail="Upgrade to Premium")
+
     return PostService.get_posts(user_id, content_type, media_type, db)
 
 @router.post("/posts/{post_id}/comments", response_model=CommentResponse)

@@ -12,7 +12,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", "postgresql+psycopg2://postgres:1234@localhost:5433/mydb2")
+config.set_main_option("sqlalchemy.url", "postgresql+psycopg2://postgres:1234@localhost:5432/mydb")
 target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:

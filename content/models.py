@@ -17,7 +17,7 @@ class Post(Base):
     likes: int = Column(Integer, default=0)
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
     is_visible: bool = Column(Boolean, nullable=False, default=True)
-    content_type: str = Column(String, nullable=False, default="basic")  # basic, archive
+    content_type: str = Column(String, nullable=False, default="basic")  # fresh, archive, hard
 
     user = relationship("User", back_populates="posts")
     comments = relationship("Comment", back_populates="post")

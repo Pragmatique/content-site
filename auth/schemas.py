@@ -20,13 +20,15 @@ class UserResponse(BaseModel):
     id: int
     username: str
     email: str
-    subscription_level: str
+    subscription_level: Optional[str] = None  # basic, pro, premium или None
+    subscription_expires_at: Optional[datetime] = None  # последняя подписка
     date_of_birth: date
     created_at: datetime
     role: str
 
     class Config:
         from_attributes = True
+
 
 class Token(BaseModel):
     """Schema for token response."""

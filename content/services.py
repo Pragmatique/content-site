@@ -31,7 +31,7 @@ class PostService:
             db: Session
     ) -> PostResponse:
         """Create a new post with media uploaded to GCore."""
-        if content_type not in ["basic", "archive"]:
+        if content_type not in ["basic", "pro", "premium"]:
             raise HTTPException(status_code=400, detail="Invalid content_type")
         if media_type not in ["image", "video", "gif"]:
             raise HTTPException(status_code=400, detail="Invalid media_type")
@@ -153,7 +153,7 @@ class PostService:
         db_post = db.query(Post).filter(Post.id == post_id).first()
         if not db_post:
             return None
-        if post_data.content_type not in ["basic", "archive"]:
+        if post_data.content_type not in ["basic", "pro", "premium"]:
             raise HTTPException(status_code=400, detail="Invalid content_type")
         if post_data.media_type not in ["image", "video", "gif"]:
             raise HTTPException(status_code=400, detail="Invalid media_type")
@@ -218,10 +218,15 @@ class PostService:
         if user_id:
             query = query.filter(Post.user_id == user_id)
         if content_type:
-            query = query.filter(Post.content_type == content_type)
+            query = query.filter(Post.content_type == content_type)  # fresh, archive, hard
         if media_type:
             query = query.filter(Post.media_type == media_type)
-        return [PostResponse.from_orm(post) for post in query.all()]
+
+        return_list = [PostResponse.from_orm(post) for post in query.all()]
+        for post in return_list:
+            print(post.media_url)
+
+        return return_list
 
     @staticmethod
     def like_post(post_id: int, db: Session) -> None:
