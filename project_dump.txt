@@ -23,6 +23,7 @@ def check_admin_role(current_user: User = Depends(get_current_user)) -> User:
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
+
 @router.get("/users", response_model=List[UserResponse], dependencies=[Depends(check_admin_role)])
 def get_users(
     subscription_level: Optional[str] = None,
@@ -116,7 +117,6 @@ class User(Base):
     username: str = Column(String, unique=True, index=True, nullable=False)
     email: str = Column(String, unique=True, index=True, nullable=False)
     password_hash: str = Column(String, nullable=False)
-    subscription_level: str = Column(String, default="free")
     date_of_birth: datetime = Column(Date, nullable=False)
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
     role: str = Column(String, nullable=False, default="user")
@@ -150,6 +150,7 @@ from auth.schemas import UserCreate, UserResponse, UserLogin, Token
 from auth.models import User
 from config import settings
 from database import get_db
+from subscription.models import Subscription
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -204,10 +205,34 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 @router.get("/me", response_model=UserResponse)
-def read_users_me(current_user: User = Depends(get_current_user)):
-    """Get current user details."""
-    return current_user
+def read_users_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get current user details with the active subscription level."""
+
+    # Ищем САМУЮ СВЕЖУЮ подписку (по expiry_date DESC)
+    latest_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id
+    ).order_by(Subscription.expiry_date.desc()).first()
+
+    # Активная подписка — только если не истекла
+    latest_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id
+    ).order_by(Subscription.expiry_date.desc()).first()
+
+    subscription_level = latest_sub.level if latest_sub else None
+    subscription_expires_at = latest_sub.expiry_date if latest_sub else None
+
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "date_of_birth": current_user.date_of_birth,
+        "created_at": current_user.created_at,
+        "role": current_user.role,
+        "subscription_level": subscription_level,  # null если нет активной
+        "subscription_expires_at": subscription_expires_at  # всегда последняя
+    }
 
 # auth/schemas.py
 # src/auth/schemas.py
@@ -232,13 +257,15 @@ class UserResponse(BaseModel):
     id: int
     username: str
     email: str
-    subscription_level: str
+    subscription_level: Optional[str] = None  # basic, pro, premium или None
+    subscription_expires_at: Optional[datetime] = None  # последняя подписка
     date_of_birth: date
     created_at: datetime
     role: str
 
     class Config:
         from_attributes = True
+
 
 class Token(BaseModel):
     """Schema for token response."""
@@ -331,10 +358,13 @@ from typing import Dict
     
 class Settings:
     """Application configuration settings."""
-    DATABASE_URL: str = "postgresql+psycopg2://postgres:1234@localhost:5433/mydb2"
+    DATABASE_URL: str = "postgresql+psycopg2://postgres:1234@localhost:5432/mydb"
     SECRET_KEY: str = "your-secret-key-for-jwt"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+
+    CDN_URL = "https://cdn.alinanightsky.com"
+    GCORE_S3_DOMAIN = "s-ed1.cloud.gcore.lu"
 
     # GCore settings
     GCORE_BUCKET_NAME: str = "alinanightsky-website"
@@ -386,7 +416,7 @@ class Post(Base):
     likes: int = Column(Integer, default=0)
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
     is_visible: bool = Column(Boolean, nullable=False, default=True)
-    content_type: str = Column(String, nullable=False, default="basic")  # basic, archive
+    content_type: str = Column(String, nullable=False, default="basic")  # fresh, archive, hard
 
     user = relationship("User", back_populates="posts")
     comments = relationship("Comment", back_populates="post")
@@ -406,6 +436,8 @@ class Comment(Base):
 
 # content/routes.py
 # src/content/routes.py
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List
@@ -416,6 +448,7 @@ from auth.routes import get_current_user
 from database import get_db
 from auth.models import User
 from typing import Optional
+from subscription.models import Subscription
 
 router = APIRouter(prefix="/content", tags=["content"])
 
@@ -429,7 +462,7 @@ def check_admin_role(current_user: User = Depends(get_current_user)) -> User:
 async def create_post(
     file: UploadFile = File(...),
     media_type: str = "image",
-    content_type: str = "basic",
+    content_type: str = "fresh",
     description: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(check_admin_role)
@@ -488,14 +521,38 @@ async def toggle_post_visibility(
         raise HTTPException(status_code=404, detail="Post not found")
     return post
 
+
 @router.get("/posts", response_model=List[PostResponse])
 async def get_posts(
-    user_id: Optional[int] = None,
-    content_type: Optional[str] = None,
-    media_type: Optional[str] = None,
-    db: Session = Depends(get_db)
+        user_id: Optional[int] = None,
+        content_type: Optional[str] = None,
+        media_type: Optional[str] = None,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
 ) -> List[PostResponse]:
-    """Retrieve posts with optional filters."""
+    """Retrieve posts with subscription-based access."""
+    print(current_user.role)
+
+    # АДМИН ВИДИТ ВСЁ — БЕЗ ПРОВЕРОК
+    if current_user.role == "admin":
+        return PostService.get_posts(user_id, content_type, media_type, db)
+
+    # ДЛЯ НЕ-АДМИНОВ — ПРОВЕРКА ПОДПИСКИ
+    active_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id,
+        Subscription.expiry_date > datetime.utcnow().date()
+    ).first()
+
+    user_level = active_sub.level if active_sub else None
+
+    if not user_level:
+        raise HTTPException(status_code=403, detail="No active subscription")
+
+    if content_type == "archive" and user_level not in ["pro", "premium"]:
+        raise HTTPException(status_code=403, detail="Upgrade to Pro or Premium")
+    if content_type == "hard" and user_level != "premium":
+        raise HTTPException(status_code=403, detail="Upgrade to Premium")
+
     return PostService.get_posts(user_id, content_type, media_type, db)
 
 @router.post("/posts/{post_id}/comments", response_model=CommentResponse)
@@ -552,25 +609,41 @@ async def like_post(
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
+from config import settings
 
 class PostCreate(BaseModel):
     """Schema for creating a post."""
     media_url: str
     media_type: str  # image, video, gif
     description: Optional[str] = None
-    content_type: str = "basic"  # basic, archive
+    content_type: str = "basic"  # fresh, archive, hard
+
+
+
+def s3_to_cdn(url: str) -> str:
+    """Convert S3 URL to CDN URL"""
+    if not url:
+        return url
+    return url.replace(f"https://{settings.GCORE_S3_DOMAIN}", settings.CDN_URL)
+
 
 class PostResponse(BaseModel):
     """Schema for post response."""
     id: int
     user_id: int
-    media_url: str
+    media_url: str # CDN URL
     media_type: str
     description: Optional[str]
     likes: int
     created_at: datetime
     is_visible: bool
-    content_type: str
+    content_type: str # fresh, archive, hard
+
+    @classmethod
+    def from_orm(cls, obj):
+        data = super().from_orm(obj)
+        data.media_url = s3_to_cdn(obj.media_url)
+        return data
 
     class Config:
         from_attributes = True
@@ -580,12 +653,18 @@ class CommentCreate(BaseModel):
     content: str
 
 class CommentResponse(BaseModel):
-    """Schema for comment response."""
     id: int
     post_id: int
     user_id: int
+    username: str  # ← НОВОЕ ПОЛЕ
     content: str
     created_at: datetime
+
+    @classmethod
+    def from_orm(cls, obj):
+        data = super().from_orm(obj)
+        data.username = obj.user.username
+        return data
 
     class Config:
         from_attributes = True
@@ -603,7 +682,7 @@ import tempfile
 import urllib.parse
 import requests
 from fastapi import HTTPException, UploadFile
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 from typing import Optional, List
 from content.models import Post, Comment
@@ -624,7 +703,7 @@ class PostService:
             db: Session
     ) -> PostResponse:
         """Create a new post with media uploaded to GCore."""
-        if content_type not in ["basic", "archive"]:
+        if content_type not in ["basic", "pro", "premium"]:
             raise HTTPException(status_code=400, detail="Invalid content_type")
         if media_type not in ["image", "video", "gif"]:
             raise HTTPException(status_code=400, detail="Invalid media_type")
@@ -746,7 +825,7 @@ class PostService:
         db_post = db.query(Post).filter(Post.id == post_id).first()
         if not db_post:
             return None
-        if post_data.content_type not in ["basic", "archive"]:
+        if post_data.content_type not in ["basic", "pro", "premium"]:
             raise HTTPException(status_code=400, detail="Invalid content_type")
         if post_data.media_type not in ["image", "video", "gif"]:
             raise HTTPException(status_code=400, detail="Invalid media_type")
@@ -811,10 +890,15 @@ class PostService:
         if user_id:
             query = query.filter(Post.user_id == user_id)
         if content_type:
-            query = query.filter(Post.content_type == content_type)
+            query = query.filter(Post.content_type == content_type)  # fresh, archive, hard
         if media_type:
             query = query.filter(Post.media_type == media_type)
-        return [PostResponse.from_orm(post) for post in query.all()]
+
+        return_list = [PostResponse.from_orm(post) for post in query.all()]
+        for post in return_list:
+            print(post.media_url)
+
+        return return_list
 
     @staticmethod
     def like_post(post_id: int, db: Session) -> None:
@@ -844,11 +928,14 @@ class CommentService:
 
     @staticmethod
     def get_comments(post_id: int, db: Session) -> List[CommentResponse]:
-        """Retrieve comments for a post."""
-        db_post = db.query(Post).filter(Post.id == post_id).first()
-        if not db_post:
-            raise HTTPException(status_code=404, detail="Post not found")
-        return [CommentResponse.from_orm(comment) for comment in db_post.comments]
+        """Retrieve comments for a post with username."""
+        comments = (
+            db.query(Comment)
+            .options(joinedload(Comment.user))  # ← ДОБАВИТЬ!
+            .filter(Comment.post_id == post_id)
+            .all()
+        )
+        return [CommentResponse.from_orm(c) for c in comments]
 
     @staticmethod
     def update_comment(comment_id: int, comment_data: CommentCreate, user_id: int, db: Session) -> Optional[CommentResponse]:
@@ -894,6 +981,29 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# database_connection_check.py
+
+from sqlalchemy import create_engine, text
+
+connection_string = "postgresql+psycopg2://postgres:1234@localhost:5432/mydb"
+
+try:
+    engine = create_engine(connection_string)
+    with engine.connect() as connection:
+        result = connection.execute(text("SELECT version();"))
+        version = result.fetchone()[0]
+        print("✅ Подключение успешно!")
+        print(f"PostgreSQL версия: {version}")
+        
+        # Проверка существования базы данных
+        result = connection.execute(text("SELECT current_database();"))
+        db_name = result.fetchone()[0]
+        print(f"Текущая БД: {db_name}")
+        
+except Exception as e:
+    print(f"❌ Ошибка подключения: {e}")
+
 
 # main.py
 # src/main.py
@@ -955,7 +1065,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", "postgresql+psycopg2://postgres:1234@localhost:5433/mydb2")
+config.set_main_option("sqlalchemy.url", "postgresql+psycopg2://postgres:1234@localhost:5432/mydb")
 target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
@@ -1123,6 +1233,39 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_users_id'), table_name='users')
     op.drop_index(op.f('ix_users_email'), table_name='users')
     op.drop_table('users')
+    # ### end Alembic commands ###
+
+
+# migrations/versions/8991e85ac8c3_drop_subscription_level_from_users.py
+"""drop subscription_level from users
+
+Revision ID: 8991e85ac8c3
+Revises: 43543ba33103
+Create Date: 2025-10-30 02:52:19.556546
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '8991e85ac8c3'
+down_revision: Union[str, None] = '43543ba33103'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_column('users', 'subscription_level')
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.add_column('users', sa.Column('subscription_level', sa.VARCHAR(), autoincrement=False, nullable=True))
     # ### end Alembic commands ###
 
 

@@ -46,12 +46,23 @@ class CommentCreate(BaseModel):
     content: str
 
 class CommentResponse(BaseModel):
-    """Schema for comment response."""
     id: int
     post_id: int
     user_id: int
+    username: str
     content: str
     created_at: datetime
+
+    @classmethod
+    def from_orm(cls, obj):
+        return cls(
+            id=obj.id,
+            post_id=obj.post_id,
+            user_id=obj.user_id,
+            username=obj.user.username,
+            content=obj.content,
+            created_at=obj.created_at,
+        )
 
     class Config:
         from_attributes = True

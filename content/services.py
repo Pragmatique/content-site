@@ -10,7 +10,7 @@ import tempfile
 import urllib.parse
 import requests
 from fastapi import HTTPException, UploadFile
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 from typing import Optional, List
 from content.models import Post, Comment
@@ -256,11 +256,17 @@ class CommentService:
 
     @staticmethod
     def get_comments(post_id: int, db: Session) -> List[CommentResponse]:
-        """Retrieve comments for a post."""
-        db_post = db.query(Post).filter(Post.id == post_id).first()
-        if not db_post:
-            raise HTTPException(status_code=404, detail="Post not found")
-        return [CommentResponse.from_orm(comment) for comment in db_post.comments]
+        """Retrieve comments for a post with username."""
+        comments = (
+            db.query(Comment)
+            .options(joinedload(Comment.user))  # ← ДОБАВИТЬ!
+            .filter(Comment.post_id == post_id)
+            .all()
+        )
+        for c in comments:
+            print(
+                f"Comment {c.id}: user_id={c.user_id}, user={c.user}, username={c.user.username if c.user else 'NO USER'}")
+        return [CommentResponse.from_orm(c) for c in comments]
 
     @staticmethod
     def update_comment(comment_id: int, comment_data: CommentCreate, user_id: int, db: Session) -> Optional[CommentResponse]:
