@@ -34,9 +34,18 @@ class PostResponse(BaseModel):
 
     @classmethod
     def from_orm(cls, obj):
-        data = super().from_orm(obj)
-        data.media_url = s3_to_cdn(obj.media_url)
-        return data
+        # НЕ используй super().from_orm(obj) → он не знает про likes_rel
+        return cls(
+            id=obj.id,
+            user_id=obj.user_id,
+            media_url=s3_to_cdn(obj.media_url),
+            media_type=obj.media_type,
+            description=obj.description,
+            created_at=obj.created_at,
+            is_visible=obj.is_visible,
+            content_type=obj.content_type,
+            likes=len(obj.likes_rel)  # ← ВЫЧИСЛЯЕМ ЗДЕСЬ
+        )
 
     class Config:
         from_attributes = True

@@ -13,7 +13,7 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 from typing import Optional, List
-from content.models import Post, Comment
+from content.models import Post, Comment, PostLike
 from content.schemas import PostCreate, PostResponse, CommentCreate, CommentResponse
 from config import settings
 
@@ -211,31 +211,50 @@ class PostService:
             user_id: Optional[int],
             content_type: Optional[str],
             media_type: Optional[str],
-            db: Session
+            db: Session,
+            limit: int = 10,
+            offset: int = 0
     ) -> List[PostResponse]:
-        """Retrieve posts with optional filters."""
-        query = db.query(Post)
+        """Retrieve posts with filters, pagination, and sorting."""
+        query = db.query(Post).options(joinedload(Post.likes_rel))
+
         if user_id:
             query = query.filter(Post.user_id == user_id)
         if content_type:
-            query = query.filter(Post.content_type == content_type)  # fresh, archive, hard
+            query = query.filter(Post.content_type == content_type)
         if media_type:
             query = query.filter(Post.media_type == media_type)
 
-        return_list = [PostResponse.from_orm(post) for post in query.all()]
-        for post in return_list:
-            print(post.media_url)
+        # СОРТИРОВКА: НОВЫЕ СВЕРХУ
+        query = query.order_by(Post.created_at.desc())
 
-        return return_list
+        # ПАГИНАЦИЯ
+        posts = query.limit(limit).offset(offset).all()
+
+        return [PostResponse.from_orm(post) for post in posts]
 
     @staticmethod
-    def like_post(post_id: int, db: Session) -> None:
-        """Increment post likes."""
+    def like_post(post_id: int, user_id: int, db: Session) -> dict:
+        """Like a post (one per user)."""
         db_post = db.query(Post).filter(Post.id == post_id).first()
         if not db_post:
             raise HTTPException(status_code=404, detail="Post not found")
-        db_post.likes = (db_post.likes or 0) + 1
+
+        # Проверяем, не лайкнул ли уже
+        existing_like = db.query(PostLike).filter(
+            PostLike.post_id == post_id,
+            PostLike.user_id == user_id
+        ).first()
+
+        if existing_like:
+            raise HTTPException(status_code=400, detail="Already liked")
+
+        # Создаём лайк
+        db_like = PostLike(post_id=post_id, user_id=user_id)
+        db.add(db_like)
         db.commit()
+
+        return {"message": "Post liked"}
 
 class CommentService:
     @staticmethod

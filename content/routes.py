@@ -90,24 +90,21 @@ async def get_posts(
         user_id: Optional[int] = None,
         content_type: Optional[str] = None,
         media_type: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ) -> List[PostResponse]:
-    """Retrieve posts with subscription-based access."""
-    print(current_user.role)
-
-    # АДМИН ВИДИТ ВСЁ — БЕЗ ПРОВЕРОК
+    """Retrieve posts with subscription-based access and pagination."""
     if current_user.role == "admin":
-        return PostService.get_posts(user_id, content_type, media_type, db)
+        return PostService.get_posts(user_id, content_type, media_type, db, limit, offset)
 
-    # ДЛЯ НЕ-АДМИНОВ — ПРОВЕРКА ПОДПИСКИ
     active_sub = db.query(Subscription).filter(
         Subscription.user_id == current_user.id,
         Subscription.expiry_date > datetime.utcnow().date()
     ).first()
 
     user_level = active_sub.level if active_sub else None
-
     if not user_level:
         raise HTTPException(status_code=403, detail="No active subscription")
 
@@ -116,7 +113,7 @@ async def get_posts(
     if content_type == "hard" and user_level != "premium":
         raise HTTPException(status_code=403, detail="Upgrade to Premium")
 
-    return PostService.get_posts(user_id, content_type, media_type, db)
+    return PostService.get_posts(user_id, content_type, media_type, db, limit, offset)
 
 @router.post("/posts/{post_id}/comments", response_model=CommentResponse)
 async def create_comment(
@@ -164,5 +161,4 @@ async def like_post(
     current_user: User = Depends(get_current_user)
 ) -> dict:
     """Like a post."""
-    PostService.like_post(post_id, db)
-    return {"message": "Post liked"}
+    return PostService.like_post(post_id, current_user.id, db)
