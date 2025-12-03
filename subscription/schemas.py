@@ -14,6 +14,7 @@ class SubscriptionResponse(BaseModel):
     user_id: int
     level: str
     expiry_date: datetime
+    payment_id: int  # ← ДОБАВИЛИ
 
     class Config:
         from_attributes = True

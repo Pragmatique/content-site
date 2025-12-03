@@ -5,7 +5,7 @@ import fnmatch
 OUTPUT_FILE = "project_dump.txt"  # итоговый файл
 ROOT_DIR = os.getcwd()  # корень проекта
 IGNORED_DIRS = {".venv", "venv", "__pycache__", ".git"}  # папки для игнора
-IGNORED_FILES = {"*.pyc", "*.pyo", "*.log"}  # маски файлов для игнора
+IGNORED_FILES = {"*.pyc", "*.pyo", "*.log", "*.md", "*.json", "*.txt"}  # маски файлов для игнора
 
 
 def is_empty_init(file_path):

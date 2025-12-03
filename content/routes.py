@@ -101,7 +101,7 @@ async def get_posts(
 
     active_sub = db.query(Subscription).filter(
         Subscription.user_id == current_user.id,
-        Subscription.expiry_date > datetime.utcnow().date()
+        Subscription.expiry_date > datetime.utcnow()
     ).first()
 
     user_level = active_sub.level if active_sub else None

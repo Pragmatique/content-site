@@ -12,6 +12,7 @@ class Subscription(Base):
     user_id: int = Column(Integer, ForeignKey("users.id"), nullable=False)
     level: str = Column(String, nullable=False)
     expiry_date: datetime = Column(DateTime, nullable=False)
+    payment_id: int = Column(Integer, ForeignKey("payments.id"), nullable=False)  # ← ДОБАВИЛИ (last successful payment)
 
     user = relationship("User", back_populates="subscriptions")
-    payments = relationship("Payment", back_populates="subscription")
+    payment = relationship("Payment")  # ← ДОБАВИЛИ (no back_populates, one-way)

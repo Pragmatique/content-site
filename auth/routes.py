@@ -1,12 +1,13 @@
 # src/auth/routes.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import EmailStr
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from auth.services import AuthService
-from auth.schemas import UserCreate, UserResponse, UserLogin, Token
-from auth.models import User
+from auth.schemas import UserCreate, UserResponse, UserLogin, Token, ForgotPasswordRequest, ResetPasswordRequest
+from auth.models import User, VerificationToken
 from config import settings
 from database import get_db
 from subscription.models import Subscription
@@ -69,18 +70,13 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
 def read_users_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get current user details with the active subscription level."""
 
-    # Ищем САМУЮ СВЕЖУЮ подписку (по expiry_date DESC)
-    latest_sub = db.query(Subscription).filter(
-        Subscription.user_id == current_user.id
+    active_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id,
+        Subscription.expiry_date > datetime.utcnow()
     ).order_by(Subscription.expiry_date.desc()).first()
 
-    # Активная подписка — только если не истекла
-    latest_sub = db.query(Subscription).filter(
-        Subscription.user_id == current_user.id
-    ).order_by(Subscription.expiry_date.desc()).first()
-
-    subscription_level = latest_sub.level if latest_sub else None
-    subscription_expires_at = latest_sub.expiry_date if latest_sub else None
+    subscription_level = active_sub.level if active_sub else None
+    subscription_expires_at = active_sub.expiry_date if active_sub else None
 
     return {
         "id": current_user.id,
@@ -89,6 +85,30 @@ def read_users_me(current_user: User = Depends(get_current_user), db: Session = 
         "date_of_birth": current_user.date_of_birth,
         "created_at": current_user.created_at,
         "role": current_user.role,
-        "subscription_level": subscription_level,  # null если нет активной
-        "subscription_expires_at": subscription_expires_at  # всегда последняя
+        "subscription_level": subscription_level,
+        "subscription_expires_at": subscription_expires_at
     }
+
+@router.post("/forgot-password")
+def forgot_password(req: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    return AuthService.send_password_reset(req.email, db)
+
+@router.post("/reset-password")
+def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
+    return AuthService.reset_password(req.token, req.new_password, db)
+
+@router.get("/verify")
+def verify_email(token: str, db: Session = Depends(get_db)):
+    ver_token = db.query(VerificationToken).filter(
+        VerificationToken.token == token,
+        VerificationToken.token_type == 'verify',
+        VerificationToken.expiry > datetime.now(timezone.utc)
+    ).first()
+    if not ver_token:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    user = db.query(User).filter(User.id == ver_token.user_id).first()
+    user.role = "user"  # Verified
+    db.delete(ver_token)
+    db.commit()
+    return {"message": "Email verified. You can now login."}

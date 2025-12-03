@@ -2,7 +2,9 @@
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
+
+from config import settings
 from database import SessionLocal
 from payment.models import Payment
 from payment.services import PaymentService
@@ -18,14 +20,17 @@ def check_pending_payments():
         pending_payments = db.query(Payment).filter(Payment.status == "pending").all()
         payment_service = PaymentService()
         for payment in pending_payments:
-            logger.info(f"Checking payment: {payment.payment_id}, expiration_time: {payment.expiration_time}")
-            if payment.expiration_time is None or payment.expiration_time < datetime.utcnow():
+            logger.info(f"Checking payment: {payment.client_payment_id}, expiration_time: {payment.expiration_time}")
+            if payment.expiration_time < datetime.now(timezone.utc).replace(tzinfo=None):
                 payment.status = "expired"
                 db.commit()
-                logger.info(f"Payment {payment.payment_id} marked as expired")
+                logger.info(f"Payment {payment.client_payment_id} marked as expired")
                 continue
             if payment_service.check_payment(payment, db):
-                logger.info(f"Payment {payment.payment_id} confirmed")
+                payment_service.confirm_payment(payment, db)
+                payment.status = "confirmed"
+                db.commit()
+                logger.info(f"Payment {payment.client_payment_id} confirmed")
     except Exception as e:
         logger.error(f"Error in check_pending_payments: {str(e)}")
     finally:
@@ -33,7 +38,6 @@ def check_pending_payments():
     logger.info("Finished check_pending_payments task")
 
 def archive_old_posts():
-    """Archive posts older than 1 year."""
     logger.info("Starting archive_old_posts task")
     db: Session = SessionLocal()
     try:
@@ -49,7 +53,6 @@ def archive_old_posts():
     logger.info("Finished archive_old_posts task")
 
 def start_scheduler():
-    """Start the background scheduler."""
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_pending_payments, 'interval', minutes=5)
     scheduler.add_job(archive_old_posts, 'interval', days=1)

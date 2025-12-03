@@ -126,6 +126,7 @@ class User(Base):
     subscriptions = relationship("Subscription", back_populates="user")
     discounts = relationship("Discount", back_populates="user")
     admin_actions = relationship("AdminActionLog", back_populates="admin")
+    payments = relationship("Payment", back_populates="user")
 
 class AdminActionLog(Base):
     """Represents a log of admin actions."""
@@ -138,16 +139,29 @@ class AdminActionLog(Base):
 
     admin = relationship("User", back_populates="admin_actions")
 
+class VerificationToken(Base):
+    """Tokens for email verification and password reset."""
+    __tablename__ = "verification_tokens"
+
+    id: int = Column(Integer, primary_key=True, index=True)
+    user_id: int = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token: str = Column(String, nullable=False, unique=True)
+    token_type: str = Column(String, nullable=False)  # 'verify' or 'reset'
+    expiry: datetime = Column(DateTime, nullable=False)
+
+    user = relationship("User")
+
 # auth/routes.py
 # src/auth/routes.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import EmailStr
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from auth.services import AuthService
 from auth.schemas import UserCreate, UserResponse, UserLogin, Token
-from auth.models import User
+from auth.models import User, VerificationToken
 from config import settings
 from database import get_db
 from subscription.models import Subscription
@@ -210,18 +224,13 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
 def read_users_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get current user details with the active subscription level."""
 
-    # Ищем САМУЮ СВЕЖУЮ подписку (по expiry_date DESC)
-    latest_sub = db.query(Subscription).filter(
-        Subscription.user_id == current_user.id
+    active_sub = db.query(Subscription).filter(
+        Subscription.user_id == current_user.id,
+        Subscription.expiry_date > datetime.utcnow()
     ).order_by(Subscription.expiry_date.desc()).first()
 
-    # Активная подписка — только если не истекла
-    latest_sub = db.query(Subscription).filter(
-        Subscription.user_id == current_user.id
-    ).order_by(Subscription.expiry_date.desc()).first()
-
-    subscription_level = latest_sub.level if latest_sub else None
-    subscription_expires_at = latest_sub.expiry_date if latest_sub else None
+    subscription_level = active_sub.level if active_sub else None
+    subscription_expires_at = active_sub.expiry_date if active_sub else None
 
     return {
         "id": current_user.id,
@@ -230,9 +239,33 @@ def read_users_me(current_user: User = Depends(get_current_user), db: Session = 
         "date_of_birth": current_user.date_of_birth,
         "created_at": current_user.created_at,
         "role": current_user.role,
-        "subscription_level": subscription_level,  # null если нет активной
-        "subscription_expires_at": subscription_expires_at  # всегда последняя
+        "subscription_level": subscription_level,
+        "subscription_expires_at": subscription_expires_at
     }
+
+@router.post("/forgot-password")
+def forgot_password(email: EmailStr, db: Session = Depends(get_db)):
+    return AuthService.send_password_reset(email, db)
+
+@router.post("/reset-password")
+def reset_password(token: str, new_password: str, db: Session = Depends(get_db)):
+    return AuthService.reset_password(token, new_password, db)
+
+@router.get("/verify")
+def verify_email(token: str, db: Session = Depends(get_db)):
+    ver_token = db.query(VerificationToken).filter(
+        VerificationToken.token == token,
+        VerificationToken.token_type == 'verify',
+        VerificationToken.expiry > datetime.now(timezone.utc)
+    ).first()
+    if not ver_token:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    user = db.query(User).filter(User.id == ver_token.user_id).first()
+    user.role = "user"  # Verified
+    db.delete(ver_token)
+    db.commit()
+    return {"message": "Email verified. You can now login."}
 
 # auth/schemas.py
 # src/auth/schemas.py
@@ -288,11 +321,15 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from auth.models import User
+from auth.models import User, VerificationToken
 from auth.schemas import UserCreate, UserResponse
 from config import settings
+import smtplib
+from email.mime.text import MIMEText
+from uuid import uuid4
+from datetime import timedelta
 
 class AuthService:
     pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -326,15 +363,15 @@ class AuthService:
 
     @staticmethod
     def authenticate_user(email: str, password: str, db: Session) -> Optional[User]:
-        """Authenticate a user by email and password."""
         user = AuthService.get_user_by_email(email, db)
         if not user or not AuthService.verify_password(password, user.password_hash):
             return None
+        if user.role == "unverified":
+            raise HTTPException(status_code=403, detail="Please verify your email first")
         return user
 
     @staticmethod
     def create_user(user_data: UserCreate, db: Session) -> UserResponse:
-        """Create a new user."""
         if db.query(User).filter(User.email == user_data.email).first():
             raise HTTPException(status_code=400, detail="Email already registered")
         if db.query(User).filter(User.username == user_data.username).first():
@@ -344,18 +381,76 @@ class AuthService:
             username=user_data.username,
             email=user_data.email,
             password_hash=AuthService.hash_password(user_data.password),
-            date_of_birth=user_data.date_of_birth
+            date_of_birth=user_data.date_of_birth,
+            role="unverified"  # Initial role
         )
         db.add(new_user)
         db.commit()
         db.refresh(new_user)
+
+        # Generate verification token
+        token = uuid4().hex
+        expiry = datetime.now(timezone.utc) + timedelta(days=30)
+        ver_token = VerificationToken(user_id=new_user.id, token=token, token_type='verify', expiry=expiry)
+        db.add(ver_token)
+        db.commit()
+
+        # Send verification email
+        verify_url = f"{settings.BASE_FRONT_URL}/verify?token={token}"  # Change to prod URL
+        body = f"Click to verify: {verify_url}"
+        AuthService.send_email(new_user.email, "Verify Your Email", body)
+
         return UserResponse.from_orm(new_user)
+
+    @staticmethod
+    def send_email(to_email: str, subject: str, body: str):
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = settings.FROM_EMAIL
+        msg['To'] = to_email
+
+        with smtplib.SMTP(settings.SMTP_SERVER, settings.SMTP_PORT) as server:
+            server.starttls()
+            server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+            server.sendmail(settings.FROM_EMAIL, to_email, msg.as_string())
+
+    @staticmethod
+    def send_password_reset(email: str, db: Session):
+        user = AuthService.get_user_by_email(email, db)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        token = uuid4().hex
+        expiry = datetime.now(timezone.utc) + timedelta(days=30)
+        reset_token = VerificationToken(user_id=user.id, token=token, token_type='reset', expiry=expiry)
+        db.add(reset_token)
+        db.commit()
+
+        reset_url = f"{settings.BASE_FRONT_URL}/reset-password?token={token}"  # Change to prod URL
+        body = f"Click to reset password: {reset_url}"
+        AuthService.send_email(email, "Reset Your Password", body)
+        return {"message": "Password reset email sent"}
+
+    @staticmethod
+    def reset_password(token: str, new_password: str, db: Session):
+        reset_token = db.query(VerificationToken).filter(
+            VerificationToken.token == token,
+            VerificationToken.token_type == 'reset',
+            VerificationToken.expiry > datetime.now(timezone.utc)
+        ).first()
+        if not reset_token:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+        user = db.query(User).filter(User.id == reset_token.user_id).first()
+        user.password_hash = AuthService.hash_password(new_password)
+        db.delete(reset_token)
+        db.commit()
+        return {"message": "Password reset successful"}
 
 # config.py
 # src/config.py
 from typing import Dict
 
-    
 class Settings:
     """Application configuration settings."""
     DATABASE_URL: str = "postgresql+psycopg2://postgres:1234@localhost:5432/mydb"
@@ -373,13 +468,17 @@ class Settings:
     GCORE_ACCESS_KEY: str = "7HQ7VZOJQXXE1M7NJ6UE"
     GCORE_SECRET_KEY: str = "t4A7iTsstPAlS3rpmdkMXdQbTuVseQVN09Kxuudx"
 
-    # Blockchain settings
-    TRON_FULL_NODE: str = "https://nile.trongrid.io"
+    # Blockchain settings — ТЕСТ
+    TRON_FULL_NODE: str = "https://nile.trongrid.io"  # ТЕСТ
+    # TRON_FULL_NODE: str = "https://api.trongrid.io"  # ПРОДАКШЕН
     TRON_WALLET_ADDRESS: str = "TAVCJF1m5XumpyZLnsUsuSCLrcmdbRA5A2"
     USDT_TRC20_ADDRESS: str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"
-    BSC_FULL_NODE: str = "https://data-seed-prebsc-1-s1.binance.org:8545"
+
+    BSC_FULL_NODE: str = "https://bsc-testnet.publicnode.com"  # Новый public endpoint с лучшими limits; альтернативы: "https://bsc-testnet.drpc.org/", "https://endpoints.omniatech.io/v1/bsc/testnet/public", "https://binance-testnet.rpc.thirdweb.com/"
+    # BSC_FULL_NODE: str = "https://bsc-dataseed.binance.org"  # ПРОДАКШЕН
     BSC_WALLET_ADDRESS: str = "0x83aEb84f08517560dEBFc7F9652d8d260C921561"
     USDT_BEP20_ADDRESS: str = "0x5c24528E2c29988f696dF755C2f9951AC6D67AEF"
+    USDT_BEP20_DECIMALS: int = 18  # Для теста; изменить на 18 для продакшена (стандартный USDT BEP20)
 
     # Subscription settings
     SUBSCRIPTION_PRICES: Dict[str, float] = {
@@ -391,14 +490,21 @@ class Settings:
 
     # Discount settings
     ENABLE_LOYALTY_DISCOUNT: bool = False
+    SMTP_SERVER: str = "smtp.zoho.eu"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = "support@alinanightsky.com"  # Zoho email
+    SMTP_PASSWORD: str = "063783qpL!"  # App password or regular
+    FROM_EMAIL: str = "support@alinanightsky.com"
+
+    BASE_URL: str = "http://localhost:8000"
+    BASE_FRONT_URL: str = "http://localhost:5173"  # Frontend URL for email links, change to prod
 
 
 settings = Settings()
 
-
 # content/models.py
 # src/content/models.py
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, ForeignKey, Text, Boolean, DateTime, UniqueConstraint
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
@@ -413,13 +519,13 @@ class Post(Base):
     media_url: str = Column(String, nullable=False)
     media_type: str = Column(String, nullable=False)  # image, video, gif
     description: Optional[str] = Column(Text, nullable=True)
-    likes: int = Column(Integer, default=0)
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
     is_visible: bool = Column(Boolean, nullable=False, default=True)
     content_type: str = Column(String, nullable=False, default="basic")  # fresh, archive, hard
 
     user = relationship("User", back_populates="posts")
     comments = relationship("Comment", back_populates="post")
+    likes_rel = relationship("PostLike", back_populates="post")
 
 class Comment(Base):
     """Represents a user comment on a post."""
@@ -433,6 +539,20 @@ class Comment(Base):
 
     post = relationship("Post", back_populates="comments")
     user = relationship("User", back_populates="comments")
+
+
+class PostLike(Base):
+    __tablename__ = "post_likes"
+
+    id: int = Column(Integer, primary_key=True, index=True)
+    post_id: int = Column(Integer, ForeignKey("posts.id"), nullable=False)
+    user_id: int = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at: datetime = Column(DateTime, default=datetime.utcnow)
+
+    post = relationship("Post", back_populates="likes_rel")
+    user = relationship("User")
+
+    __table_args__ = (UniqueConstraint('post_id', 'user_id', name='unique_post_user_like'),)
 
 # content/routes.py
 # src/content/routes.py
@@ -527,24 +647,21 @@ async def get_posts(
         user_id: Optional[int] = None,
         content_type: Optional[str] = None,
         media_type: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ) -> List[PostResponse]:
-    """Retrieve posts with subscription-based access."""
-    print(current_user.role)
-
-    # АДМИН ВИДИТ ВСЁ — БЕЗ ПРОВЕРОК
+    """Retrieve posts with subscription-based access and pagination."""
     if current_user.role == "admin":
-        return PostService.get_posts(user_id, content_type, media_type, db)
+        return PostService.get_posts(user_id, content_type, media_type, db, limit, offset)
 
-    # ДЛЯ НЕ-АДМИНОВ — ПРОВЕРКА ПОДПИСКИ
     active_sub = db.query(Subscription).filter(
         Subscription.user_id == current_user.id,
-        Subscription.expiry_date > datetime.utcnow().date()
+        Subscription.expiry_date > datetime.utcnow()
     ).first()
 
     user_level = active_sub.level if active_sub else None
-
     if not user_level:
         raise HTTPException(status_code=403, detail="No active subscription")
 
@@ -553,7 +670,7 @@ async def get_posts(
     if content_type == "hard" and user_level != "premium":
         raise HTTPException(status_code=403, detail="Upgrade to Premium")
 
-    return PostService.get_posts(user_id, content_type, media_type, db)
+    return PostService.get_posts(user_id, content_type, media_type, db, limit, offset)
 
 @router.post("/posts/{post_id}/comments", response_model=CommentResponse)
 async def create_comment(
@@ -601,8 +718,7 @@ async def like_post(
     current_user: User = Depends(get_current_user)
 ) -> dict:
     """Like a post."""
-    PostService.like_post(post_id, db)
-    return {"message": "Post liked"}
+    return PostService.like_post(post_id, current_user.id, db)
 
 # content/schemas.py
 # src/content/schemas.py
@@ -641,9 +757,18 @@ class PostResponse(BaseModel):
 
     @classmethod
     def from_orm(cls, obj):
-        data = super().from_orm(obj)
-        data.media_url = s3_to_cdn(obj.media_url)
-        return data
+        # НЕ используй super().from_orm(obj) → он не знает про likes_rel
+        return cls(
+            id=obj.id,
+            user_id=obj.user_id,
+            media_url=s3_to_cdn(obj.media_url),
+            media_type=obj.media_type,
+            description=obj.description,
+            created_at=obj.created_at,
+            is_visible=obj.is_visible,
+            content_type=obj.content_type,
+            likes=len(obj.likes_rel)  # ← ВЫЧИСЛЯЕМ ЗДЕСЬ
+        )
 
     class Config:
         from_attributes = True
@@ -656,15 +781,20 @@ class CommentResponse(BaseModel):
     id: int
     post_id: int
     user_id: int
-    username: str  # ← НОВОЕ ПОЛЕ
+    username: str
     content: str
     created_at: datetime
 
     @classmethod
     def from_orm(cls, obj):
-        data = super().from_orm(obj)
-        data.username = obj.user.username
-        return data
+        return cls(
+            id=obj.id,
+            post_id=obj.post_id,
+            user_id=obj.user_id,
+            username=obj.user.username,
+            content=obj.content,
+            created_at=obj.created_at,
+        )
 
     class Config:
         from_attributes = True
@@ -685,7 +815,7 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session, joinedload
 from datetime import datetime
 from typing import Optional, List
-from content.models import Post, Comment
+from content.models import Post, Comment, PostLike
 from content.schemas import PostCreate, PostResponse, CommentCreate, CommentResponse
 from config import settings
 
@@ -883,31 +1013,50 @@ class PostService:
             user_id: Optional[int],
             content_type: Optional[str],
             media_type: Optional[str],
-            db: Session
+            db: Session,
+            limit: int = 10,
+            offset: int = 0
     ) -> List[PostResponse]:
-        """Retrieve posts with optional filters."""
-        query = db.query(Post)
+        """Retrieve posts with filters, pagination, and sorting."""
+        query = db.query(Post).options(joinedload(Post.likes_rel))
+
         if user_id:
             query = query.filter(Post.user_id == user_id)
         if content_type:
-            query = query.filter(Post.content_type == content_type)  # fresh, archive, hard
+            query = query.filter(Post.content_type == content_type)
         if media_type:
             query = query.filter(Post.media_type == media_type)
 
-        return_list = [PostResponse.from_orm(post) for post in query.all()]
-        for post in return_list:
-            print(post.media_url)
+        # СОРТИРОВКА: НОВЫЕ СВЕРХУ
+        query = query.order_by(Post.created_at.desc())
 
-        return return_list
+        # ПАГИНАЦИЯ
+        posts = query.limit(limit).offset(offset).all()
+
+        return [PostResponse.from_orm(post) for post in posts]
 
     @staticmethod
-    def like_post(post_id: int, db: Session) -> None:
-        """Increment post likes."""
+    def like_post(post_id: int, user_id: int, db: Session) -> dict:
+        """Like a post (one per user)."""
         db_post = db.query(Post).filter(Post.id == post_id).first()
         if not db_post:
             raise HTTPException(status_code=404, detail="Post not found")
-        db_post.likes = (db_post.likes or 0) + 1
+
+        # Проверяем, не лайкнул ли уже
+        existing_like = db.query(PostLike).filter(
+            PostLike.post_id == post_id,
+            PostLike.user_id == user_id
+        ).first()
+
+        if existing_like:
+            raise HTTPException(status_code=400, detail="Already liked")
+
+        # Создаём лайк
+        db_like = PostLike(post_id=post_id, user_id=user_id)
+        db.add(db_like)
         db.commit()
+
+        return {"message": "Post liked"}
 
 class CommentService:
     @staticmethod
@@ -935,6 +1084,9 @@ class CommentService:
             .filter(Comment.post_id == post_id)
             .all()
         )
+        for c in comments:
+            print(
+                f"Comment {c.id}: user_id={c.user_id}, user={c.user}, username={c.user.username if c.user else 'NO USER'}")
         return [CommentResponse.from_orm(c) for c in comments]
 
     @staticmethod
@@ -1100,6 +1252,50 @@ if context.is_offline_mode():
 else:
     run_migrations_online()
 
+# migrations/versions/03bb9184cf11_add_verification_token.py
+"""add verification_token
+
+Revision ID: 03bb9184cf11
+Revises: b524a7951f8f
+Create Date: 2025-11-28 02:37:14.895984
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '03bb9184cf11'
+down_revision: Union[str, None] = 'b524a7951f8f'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table('verification_tokens',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('user_id', sa.Integer(), nullable=False),
+    sa.Column('token', sa.String(), nullable=False),
+    sa.Column('token_type', sa.String(), nullable=False),
+    sa.Column('expiry', sa.DateTime(), nullable=False),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('token')
+    )
+    op.create_index(op.f('ix_verification_tokens_id'), 'verification_tokens', ['id'], unique=False)
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f('ix_verification_tokens_id'), table_name='verification_tokens')
+    op.drop_table('verification_tokens')
+    # ### end Alembic commands ###
+
+
 # migrations/versions/43543ba33103_initial_migration.py
 """Initial migration
 
@@ -1236,6 +1432,52 @@ def downgrade() -> None:
     # ### end Alembic commands ###
 
 
+# migrations/versions/4b229703b1ae_add_post_likes_table.py
+"""add post_likes table
+
+Revision ID: 4b229703b1ae
+Revises: 8991e85ac8c3
+Create Date: 2025-11-07 00:20:27.977788
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '4b229703b1ae'
+down_revision: Union[str, None] = '8991e85ac8c3'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table('post_likes',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('post_id', sa.Integer(), nullable=False),
+    sa.Column('user_id', sa.Integer(), nullable=False),
+    sa.Column('created_at', sa.DateTime(), nullable=True),
+    sa.ForeignKeyConstraint(['post_id'], ['posts.id'], ),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('post_id', 'user_id', name='unique_post_user_like')
+    )
+    op.create_index(op.f('ix_post_likes_id'), 'post_likes', ['id'], unique=False)
+    op.drop_column('posts', 'likes')
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.add_column('posts', sa.Column('likes', sa.INTEGER(), autoincrement=False, nullable=True))
+    op.drop_index(op.f('ix_post_likes_id'), table_name='post_likes')
+    op.drop_table('post_likes')
+    # ### end Alembic commands ###
+
+
 # migrations/versions/8991e85ac8c3_drop_subscription_level_from_users.py
 """drop subscription_level from users
 
@@ -1269,6 +1511,90 @@ def downgrade() -> None:
     # ### end Alembic commands ###
 
 
+# migrations/versions/b524a7951f8f_payment_subscription_refactor.py
+"""payment_subscription_refactor
+
+Revision ID: b524a7951f8f
+Revises: 4b229703b1ae
+Create Date: 2025-11-11 02:19:37.058864
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = 'b524a7951f8f'
+down_revision: Union[str, None] = '4b229703b1ae'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # Добавляем новые столбцы с nullable=True где нужно
+    op.add_column('payments', sa.Column('user_id', sa.Integer(), nullable=True))
+    op.add_column('payments', sa.Column('purpose', sa.String(), nullable=True))
+    op.add_column('payments', sa.Column('level', sa.String(), nullable=True))
+    op.add_column('payments', sa.Column('client_payment_id', sa.String(), nullable=True))
+
+    # Обновляем данные
+    op.execute('UPDATE payments SET user_id = (SELECT user_id FROM subscriptions WHERE subscriptions.id = payments.subscription_id)')
+    op.execute("UPDATE payments SET purpose = 'subscription'")
+    # level оставляем null для legacy
+    op.execute('UPDATE payments SET client_payment_id = payment_id')
+
+    # Делаем NOT NULL где нужно
+    op.alter_column('payments', 'user_id', nullable=False)
+    op.alter_column('payments', 'purpose', nullable=False)
+
+    # Добавляем FK
+    op.create_foreign_key(None, 'payments', 'users', ['user_id'], ['id'])
+
+    # Добавляем payment_id в subscriptions
+    op.add_column('subscriptions', sa.Column('payment_id', sa.Integer(), nullable=True))
+    op.execute('UPDATE subscriptions SET payment_id = (SELECT id FROM payments WHERE payments.subscription_id = subscriptions.id LIMIT 1)')
+    op.alter_column('subscriptions', 'payment_id', nullable=False)
+    op.create_foreign_key(None, 'subscriptions', 'payments', ['payment_id'], ['id'])
+
+    # Удаляем старые столбцы
+    op.drop_constraint('payments_subscription_id_fkey', 'payments', type_='foreignkey')
+    op.drop_column('payments', 'subscription_id')
+    op.drop_column('payments', 'discount_applied')
+    op.drop_column('payments', 'payout_currency')
+    op.drop_column('payments', 'payment_id')
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # Восстанавливаем старые столбцы
+    op.add_column('payments', sa.Column('payment_id', sa.VARCHAR(), autoincrement=False, nullable=True))
+    op.add_column('payments', sa.Column('payout_currency', sa.VARCHAR(), autoincrement=False, nullable=True))
+    op.add_column('payments', sa.Column('discount_applied', sa.INTEGER(), autoincrement=False, nullable=True))
+    op.add_column('payments', sa.Column('subscription_id', sa.INTEGER(), autoincrement=False, nullable=True))
+
+    # Обновляем данные обратно
+    op.execute('UPDATE payments SET payment_id = client_payment_id')
+    # subscription_id, discount_applied, payout_currency - assume defaults or manual
+
+    op.alter_column('payments', 'subscription_id', nullable=False)
+
+    # Восстанавливаем FK
+    op.drop_constraint(None, 'payments', type_='foreignkey')
+    op.create_foreign_key('payments_subscription_id_fkey', 'payments', 'subscriptions', ['subscription_id'], ['id'])
+
+    # Удаляем новые столбцы
+    op.drop_column('payments', 'client_payment_id')
+    op.drop_column('payments', 'level')
+    op.drop_column('payments', 'purpose')
+    op.drop_column('payments', 'user_id')
+
+    # Удаляем payment_id из subscriptions
+    op.drop_constraint(None, 'subscriptions', type_='foreignkey')
+    op.drop_column('subscriptions', 'payment_id')
+    # ### end Alembic commands ###
+
 # payment/models.py
 # src/payment/models.py
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Boolean
@@ -1277,24 +1603,25 @@ from database import Base
 from datetime import datetime
 
 class Payment(Base):
-    """Represents a payment for a subscription."""
+    """Represents a payment."""
     __tablename__ = "payments"
 
     id: int = Column(Integer, primary_key=True, index=True)
-    subscription_id: int = Column(Integer, ForeignKey("subscriptions.id"), nullable=False)
+    user_id: int = Column(Integer, ForeignKey("users.id"), nullable=False)  # ← ДОБАВИЛИ
+    purpose: str = Column(String, nullable=False, default="subscription")  # ← ДОБАВИЛИ (e.g. "subscription", "donation")
+    level: str = Column(String, nullable=True)  # ← ДОБАВИЛИ (basic/pro/premium, only if purpose=="subscription")
     discount_id: int = Column(Integer, ForeignKey("discounts.id"), nullable=True)
     payment_method: str = Column(String, nullable=False)
-    payment_id: str = Column(String, nullable=True)
+    client_payment_id: str = Column(String, nullable=True)  # ← ПЕРЕИМЕНОВАЛИ payment_id
     transaction_id: str = Column(String, nullable=True)
     amount: int = Column(Integer, nullable=False)
     currency: str = Column(String, nullable=False)
-    payout_currency: str = Column(String, default="USDT")
-    discount_applied: int = Column(Integer, default=0)
-    status: str = Column(String, default="pending")
+    # УБРАЛИ payout_currency, discount_applied, subscription_id
+    status: str = Column(String, default="pending")  # pending, confirmed, expired, failed
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
     expiration_time: datetime = Column(DateTime, nullable=False)
 
-    subscription = relationship("Subscription", back_populates="payments")
+    user = relationship("User", back_populates="payments")  # ← ДОБАВИЛИ
     discount = relationship("Discount", back_populates="payments")
 
 class Discount(Base):
@@ -1319,9 +1646,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
 from payment.services import PaymentService
-from payment.schemas import PaymentResponse, DiscountCreate, DiscountResponse
+from payment.schemas import PaymentResponse, DiscountCreate, DiscountResponse, PaymentCheckResponse
 from payment.models import Payment
-from subscription.models import Subscription
 from auth.routes import get_current_user
 from auth.models import User
 from database import get_db
@@ -1331,91 +1657,78 @@ from config import settings
 router = APIRouter(prefix="/payments", tags=["payments"])
 
 def check_admin_role(current_user: User = Depends(get_current_user)) -> User:
-    """Ensure the user has admin role."""
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
-@router.get("/check-payment/{payment_id}")
+@router.get("/check-payment/{client_payment_id}", response_model=PaymentCheckResponse)
 def check_payment(
-    payment_id: str,
+    client_payment_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Check payment status."""
-    expired_payments = db.query(Payment).filter(
-        Payment.status == "pending",
-        Payment.expiration_time < datetime.utcnow()
-    ).all()
-    for payment in expired_payments:
-        payment.status = "expired"
-    db.commit()
-
-    payment = db.query(Payment).filter(Payment.payment_id == payment_id).first()
+    """Check payment status and return full UX info."""
+    payment = db.query(Payment).filter(Payment.client_payment_id == client_payment_id).first()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
 
     if payment.status == "pending" and datetime.utcnow() > payment.expiration_time:
         payment.status = "expired"
         db.commit()
-        raise HTTPException(status_code=400, detail="Payment expired")
 
-    payment_service = PaymentService()
-    if payment_service.check_payment(payment, db):
-        subscription = payment.subscription
-        subscription.expiry_date = datetime.utcnow() + timedelta(days=settings.SUBSCRIPTION_DURATION_DAYS)
-        current_user.subscription_level = subscription.level
-        db.commit()
-        return {"status": "confirmed"}
-    return {"status": payment.status}
+    if payment.status == "pending":
+        payment_service = PaymentService()
+        if payment_service.check_payment(payment, db):
+            payment_service.confirm_payment(payment, db)
+            payment.status = "confirmed"
+            db.commit()
+
+    time_left = 0
+    if payment.status == "pending":
+        time_left = max(0, int((payment.expiration_time - datetime.utcnow()).total_seconds()))
+
+    if payment.currency == "usdttrc20":
+        payment_url = settings.TRON_WALLET_ADDRESS
+    elif payment.currency == "usdtbep20":
+        payment_url = settings.BSC_WALLET_ADDRESS
+    else:
+        payment_url = ""
+
+    return PaymentCheckResponse(
+        status=payment.status,
+        amount=payment.amount / 100.0,
+        currency=payment.currency,
+        payment_url=payment_url,
+        expires_at=payment.expiration_time,
+        time_left_seconds=time_left
+    )
 
 @router.get("/", response_model=List[PaymentResponse])
 def get_user_payments(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Retrieve user payments."""
     return PaymentService.get_user_payments(current_user.id, db)
 
 @router.post("/discounts", response_model=DiscountResponse, dependencies=[Depends(check_admin_role)])
-def create_discount(
-    discount: DiscountCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(check_admin_role)
-):
-    """Create a new discount."""
+def create_discount(discount: DiscountCreate, db: Session = Depends(get_db), current_user: User = Depends(check_admin_role)):
     return PaymentService.create_discount(discount, db)
 
 @router.put("/discounts/{discount_id}", response_model=DiscountResponse, dependencies=[Depends(check_admin_role)])
-def update_discount(
-    discount_id: int,
-    discount_data: DiscountCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(check_admin_role)
-):
-    """Update a discount."""
+def update_discount(discount_id: int, discount_data: DiscountCreate, db: Session = Depends(get_db), current_user: User = Depends(check_admin_role)):
     discount = PaymentService.update_discount(discount_id, discount_data, db)
     if not discount:
         raise HTTPException(status_code=404, detail="Discount not found")
     return discount
 
 @router.delete("/discounts/{discount_id}", dependencies=[Depends(check_admin_role)])
-def delete_discount(
-    discount_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(check_admin_role)
-):
-    """Delete a discount."""
+def delete_discount(discount_id: int, db: Session = Depends(get_db), current_user: User = Depends(check_admin_role)):
     if not PaymentService.delete_discount(discount_id, db):
         raise HTTPException(status_code=404, detail="Discount not found")
     return {"message": "Discount deleted"}
 
 @router.get("/discounts", response_model=List[DiscountResponse], dependencies=[Depends(check_admin_role)])
-def get_discounts(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(check_admin_role)
-):
-    """Retrieve all discounts."""
+def get_discounts(db: Session = Depends(get_db), current_user: User = Depends(check_admin_role)):
     return PaymentService.get_discounts(db)
 
 # payment/schemas.py
@@ -1427,28 +1740,40 @@ from typing import Optional
 class PaymentResponse(BaseModel):
     """Schema for payment response."""
     id: int
-    subscription_id: int
+    user_id: int  # ← ДОБАВИЛИ
+    purpose: str  # ← ДОБАВИЛИ
+    level: Optional[str]  # ← ДОБАВИЛИ
     discount_id: Optional[int]
     payment_method: str
-    payment_id: Optional[str]
+    client_payment_id: Optional[str]  # ← ПЕРЕИМЕНОВАЛИ
     transaction_id: Optional[str]
     amount: int
     currency: str
-    payout_currency: Optional[str]
-    discount_applied: int
+    # УБРАЛИ payout_currency, discount_applied
     status: str
     created_at: datetime
+    expiration_time: datetime
 
     class Config:
         from_attributes = True
 
 class PaymentCreateResponse(BaseModel):
     """Schema for payment creation response."""
-    payment_id: str
+    client_payment_id: str  # ← ПЕРЕИМЕНОВАЛИ
     payment_url: str
     amount: float
     final_amount: float
     discount_info: str
+    expires_at: datetime
+    currency: str  # ← ДОБАВИЛИ (для фронта)
+
+class PaymentCheckResponse(BaseModel):
+    status: str
+    amount: float
+    currency: str
+    payment_url: str
+    expires_at: datetime
+    time_left_seconds: int
 
 class DiscountCreate(BaseModel):
     """Schema for creating a discount."""
@@ -1478,19 +1803,26 @@ class DiscountResponse(BaseModel):
 from web3 import Web3
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
+import requests
+from uuid import uuid4
+import time  # Для backoff в retry
+import logging
+from web3.middleware import geth_poa_middleware
+
 from payment.models import Payment, Discount
-from payment.schemas import PaymentResponse, DiscountCreate, DiscountResponse
+from payment.schemas import PaymentResponse, DiscountCreate, DiscountResponse, PaymentCreateResponse
 from subscription.models import Subscription
 from config import settings
-import requests
-import json
+
+logger = logging.getLogger(__name__)  # Логгер для детализации ошибок и параметров
 
 class PaymentService:
     def __init__(self):
         self.tron_wallet_address = settings.TRON_WALLET_ADDRESS
         self.bsc = Web3(Web3.HTTPProvider(settings.BSC_FULL_NODE))
+        self.bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
         self.bsc_wallet_address = settings.BSC_WALLET_ADDRESS
         self.usdt_trc20_address = settings.USDT_TRC20_ADDRESS
         self.usdt_bep20_address = settings.USDT_BEP20_ADDRESS
@@ -1504,107 +1836,236 @@ class PaymentService:
                 ],
                 "name": "Transfer",
                 "type": "event"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
             }
         ]
         self.usdt_bep20_contract = self.bsc.eth.contract(
             address=self.usdt_bep20_address,
             abi=self.usdt_bep20_abi
         )
+        # Динамически получаем decimals для USDT BEP20
+        try:
+            self.usdt_bep20_decimals = self.usdt_bep20_contract.functions.decimals().call()
+            logger.info(f"USDT BEP20 decimals: {self.usdt_bep20_decimals}")
+        except Exception as e:
+            logger.error(f"Error getting USDT BEP20 decimals: {str(e)}")
+            self.usdt_bep20_decimals = settings.USDT_BEP20_DECIMALS  # Fallback из config
 
-    def generate_unique_amount(self, base_price: float, db: Session) -> float:
-        """Generate a unique payment amount to avoid conflicts."""
-        amounts_to_try = [
-            base_price,
-            base_price - 0.01,
-            base_price + 0.01,
-            base_price - 0.02,
-            base_price + 0.02,
+    @staticmethod
+    def generate_unique_amount(final_price: float, db: Session) -> float:
+        candidates = [
+            final_price,
+            final_price - 0.01, final_price + 0.01,
+            final_price - 0.02, final_price + 0.02,
         ]
-        for amount in amounts_to_try:
-            existing_payment = db.query(Payment).filter(
-                Payment.amount == int(amount * 100),
+        for amount in candidates:
+            if amount <= 0:
+                continue
+            int_amount = int(amount * 100)
+            exists = db.query(Payment).filter(
+                Payment.amount == int_amount,
                 Payment.status == "pending",
-                Payment.expiration_time >= datetime.utcnow()
+                Payment.expiration_time > datetime.now(timezone.utc)
             ).first()
-            if not existing_payment:
+            if not exists:
                 return amount
-        raise HTTPException(status_code=400, detail="No available unique amount")
+        raise HTTPException(status_code=400, detail="No available unique amount. Try again later.")
 
-    def create_payment(self, amount: float, currency: str, db: Session) -> dict:
-        """Create a payment request."""
+    def create_payment(self, user_id: int, purpose: str, level: Optional[str], amount: float, currency: str, db: Session) -> PaymentCreateResponse:
         if currency == "usdttrc20":
             address = self.tron_wallet_address
         elif currency == "usdtbep20":
             address = self.bsc_wallet_address
-        elif currency == "bnb":
-            address = self.bsc_wallet_address
         else:
             raise HTTPException(status_code=400, detail="Unsupported currency")
-        return {"payment_url": address, "amount": amount}
+
+        now_utc = datetime.now(timezone.utc)
+        expiry_utc = now_utc + timedelta(minutes=30)
+        payment = Payment(
+            user_id=user_id,
+            purpose=purpose,
+            level=level if purpose == "subscription" else None,
+            payment_method="crypto",
+            client_payment_id=f"pay_{uuid4().hex[:12]}",
+            amount=int(amount * 100),
+            currency=currency,
+            status="pending",
+            expiration_time=expiry_utc.replace(tzinfo=None),  # Save naive for DB
+            created_at=now_utc.replace(tzinfo=None)  # Save naive for DB
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+
+        return PaymentCreateResponse(
+            client_payment_id=payment.client_payment_id,
+            payment_url=address,
+            amount=amount,
+            final_amount=amount,
+            discount_info="",
+            expires_at=payment.expiration_time,
+            currency=currency
+        )
 
     def check_payment(self, payment: Payment, db: Session) -> bool:
-        """Check payment status in blockchain."""
         amount_in_usd = payment.amount / 100.0
+        created_at_utc = payment.created_at.replace(tzinfo=timezone.utc)
+        expiration_utc = payment.expiration_time.replace(tzinfo=timezone.utc)
+        min_ts = int(created_at_utc.timestamp() * 1000)
+        max_ts = int(expiration_utc.timestamp() * 1000)
+        current_time = datetime.now(timezone.utc)
+
+        min_dt = datetime.fromtimestamp(min_ts / 1000, tz=timezone.utc)
+        max_dt = datetime.fromtimestamp(max_ts / 1000, tz=timezone.utc)
+
+        logger.info(f"Checking payment {payment.client_payment_id}: currency={payment.currency}, expected_amount={amount_in_usd}, created_at={created_at_utc.isoformat()} (UTC), expiration_time={expiration_utc.isoformat()} (UTC), current_time={current_time.isoformat()} (UTC), min_ts={min_ts}, max_ts={max_ts}, min_dt={min_dt.isoformat()} (UTC), max_dt={max_dt.isoformat()} (UTC)")
+
         if payment.currency == "usdttrc20":
-            url = f"https://nile.trongrid.io/v1/accounts/{self.tron_wallet_address}/transactions/trc20"
-            params = {"contract_address": self.usdt_trc20_address}
-            response = requests.get(url, params=params).json()
-            for tx in response.get("data", []):
-                if (tx["to"] == self.tron_wallet_address and
-                    float(tx["value"]) / 10**6 == amount_in_usd):
-                    payment.transaction_id = tx["transaction_id"]
-                    payment.status = "confirmed"
-                    db.commit()
-                    return True
-        elif payment.currency in ["usdtbep20", "bnb"]:
+            url = f"{settings.TRON_FULL_NODE}/v1/accounts/{self.tron_wallet_address}/transactions/trc20"
+            params = {
+                "contract_address": self.usdt_trc20_address,
+                "min_timestamp": min_ts,
+                "max_timestamp": max_ts
+            }
+            logger.info(f"TRON API call: url={url}, params={params}")
+            try:
+                response = requests.get(url, params=params, timeout=10)
+                logger.info(f"TRON API response status: {response.status_code}")
+                if response.status_code != 200:
+                    logger.error(f"TRON API non-200 status: {response.status_code}, text={response.text}")
+                    return False
+                data = response.json().get("data", [])
+                logger.info(f"Found {len(data)} transactions in TRON response")
+                if not data:
+                    logger.info("No transactions found in API response")
+                logger.info("Matching only by to and amount, trusting API filter")
+                for tx in data:
+                    ts = tx.get("timestamp", 0)
+                    dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat() if ts else "N/A"
+                    calculated_value = float(tx.get("value", 0)) / 10 ** 6
+                    logger.info(f"Tx ID: {tx.get('transaction_id')}, To: {tx.get('to')}, Raw Value: {tx.get('value')}, Calculated Value: {calculated_value}, Timestamp: {ts} ({dt} UTC), Type: {tx.get('type')}")
+                    if ts != 0 and not (min_ts <= ts <= max_ts):
+                        logger.info(f"API returned tx with unexpected ts {ts} ({dt} UTC) outside requested range {min_ts}-{max_ts} ({min_dt.isoformat()}-{max_dt.isoformat()} UTC)")
+                        continue
+                    if (tx["to"] == self.tron_wallet_address and
+                            calculated_value == amount_in_usd):
+                        payment.transaction_id = tx["transaction_id"]
+                        db.commit()
+                        logger.info(f"Matched tx {tx['transaction_id']} with amount {calculated_value}")
+                        return True
+                    elif calculated_value != amount_in_usd:
+                        logger.info(f"Mismatched amount in tx {tx.get('transaction_id')}: calculated {calculated_value} != expected {amount_in_usd}")
+            except Exception as e:
+                logger.error(f"TRON API error for payment {payment.client_payment_id}: {str(e)}")
+        elif payment.currency == "usdtbep20":
             latest_block = self.bsc.eth.block_number
-            for block in range(latest_block - 100, latest_block + 1):
-                if payment.currency == "usdtbep20":
+            time_diff_sec = (max_ts - min_ts) / 1000
+            blocks_to_scan = int(time_diff_sec // 3) + 1000
+            from_block = max(0, latest_block - blocks_to_scan)
+
+            try:
+                latest_ts = self.bsc.eth.get_block(latest_block)['timestamp'] * 1000
+                from_ts = self.bsc.eth.get_block(from_block)['timestamp'] * 1000
+                logger.info(f"Scan range ts: from_ts={from_ts} to latest_ts={latest_ts}")
+            except Exception as e:
+                logger.error(f"Error getting block ts: {str(e)}")
+
+            logger.info(f"BSC scan for payment {payment.client_payment_id}: from_block={from_block}, to_block={latest_block}, blocks_to_scan={blocks_to_scan}")
+
+            chunk_size = 50
+            current_block = from_block
+            while current_block < latest_block:
+                chunk_end = min(current_block + chunk_size, latest_block)
+                for attempt in range(3):
+                    time.sleep(0.5)
                     try:
                         transfer_events = self.usdt_bep20_contract.events.Transfer.get_logs(
-                            fromBlock=block,
-                            toBlock=block,
+                            fromBlock=current_block,
+                            toBlock=chunk_end,
                             argument_filters={"to": self.bsc_wallet_address}
                         )
+                        logger.info(f"Found {len(transfer_events)} transfer events in chunk {current_block}-{chunk_end}, attempt {attempt + 1}")
                         for event in transfer_events:
-                            amount_transferred = event["args"]["value"] / 10**18
-                            if amount_transferred == amount_in_usd:
-                                payment.transaction_id = event["transactionHash"].hex()
-                                payment.status = "confirmed"
-                                db.commit()
-                                return True
-                    except Exception:
-                        continue
-                elif payment.currency == "bnb":
-                    block_data = self.bsc.eth.get_block(block, full_transactions=True)
-                    for tx in block_data.transactions:
-                        if (tx.get("to") == self.bsc_wallet_address and
-                            float(tx.get("value", 0)) / 10**18 == amount_in_usd):
-                            payment.transaction_id = tx["hash"].hex()
-                            payment.status = "confirmed"
-                            db.commit()
-                            return True
+                            try:
+                                block_ts = self.bsc.eth.get_block(event.blockNumber)['timestamp'] * 1000
+                            except Exception as ts_e:
+                                logger.error(f"Error getting block_ts for block {event.blockNumber}: {str(ts_e)}")
+                                continue
+                            amount_transferred = event["args"]["value"] / 10 ** self.usdt_bep20_decimals  # Используем динамические decimals
+                            logger.info(f"Event tx {event['transactionHash'].hex()}, from {event['args']['from']}, to {event['args']['to']}, raw_value {event['args']['value']}, amount_transferred {amount_transferred}, block {event.blockNumber}, block_ts {block_ts}")
+                            if min_ts <= block_ts <= max_ts:
+                                if amount_transferred == amount_in_usd:
+                                    payment.transaction_id = event["transactionHash"].hex()
+                                    db.commit()
+                                    logger.info(f"Payment {payment.client_payment_id} matched tx {payment.transaction_id}")
+                                    return True
+                                else:
+                                    logger.info(f"Mismatched amount in tx {event['transactionHash'].hex()}: transferred {amount_transferred} != expected {amount_in_usd}")
+                            else:
+                                logger.info(f"Event outside range: tx {event['transactionHash'].hex()}, block_ts {block_ts} not in {min_ts}-{max_ts}")
+                        break
+                    except Exception as e:
+                        logger.error(f"BSC error for payment {payment.client_payment_id} in chunk {current_block}-{chunk_end}, attempt {attempt + 1}: {str(e)}")
+                        if attempt < 2:
+                            sleep_time = 2 ** attempt
+                            logger.info(f"Retrying chunk after {sleep_time} sec backoff")
+                            time.sleep(sleep_time)
+                        else:
+                            return False
+                current_block = chunk_end + 1
+            logger.info(f"No matching events for payment {payment.client_payment_id} after scanning all chunks")
         return False
 
+    def confirm_payment(self, payment: Payment, db: Session):
+        """Confirm logic after blockchain success."""
+        if payment.purpose != "subscription":
+            return
+
+        active_sub = db.query(Subscription).filter(
+            Subscription.user_id == payment.user_id,
+            Subscription.expiry_date > datetime.now(timezone.utc)
+        ).first()
+
+        if active_sub and active_sub.level == payment.level:
+            active_sub.expiry_date += timedelta(days=settings.SUBSCRIPTION_DURATION_DAYS)
+            active_sub.payment_id = payment.id
+        else:
+            new_sub = Subscription(
+                user_id=payment.user_id,
+                level=payment.level,
+                expiry_date=datetime.now(timezone.utc) + timedelta(days=settings.SUBSCRIPTION_DURATION_DAYS),
+                payment_id=payment.id
+            )
+            db.add(new_sub)
+            if active_sub:
+                active_sub.expiry_date = datetime.now(timezone.utc)
+
+        db.commit()
+
     @staticmethod
-    def get_user_payments(user_id: int, db: Session) -> list[PaymentResponse]:
-        """Retrieve all payments for a user."""
-        payments = db.query(Payment).join(Subscription).filter(Subscription.user_id == user_id).all()
-        return [PaymentResponse.from_orm(payment) for payment in payments]
+    def get_user_payments(user_id: int, db: Session) -> List[PaymentResponse]:
+        payments = db.query(Payment).filter(Payment.user_id == user_id).all()
+        return [PaymentResponse.from_orm(p) for p in payments]
 
     @staticmethod
     def create_discount(discount_data: DiscountCreate, db: Session) -> DiscountResponse:
-        """Create a new discount."""
         db_discount = Discount(**discount_data.dict())
         db.add(db_discount)
         db.commit()
         db.refresh(db_discount)
         usage_count = db.query(Payment).filter(Payment.discount_id == db_discount.id).count()
-        return DiscountResponse(**db_discount.__dict__, usage_count=usage_count)
+        return DiscountResponse.from_orm(db_discount).copy(update={"usage_count": usage_count})
 
     @staticmethod
     def update_discount(discount_id: int, discount_data: DiscountCreate, db: Session) -> Optional[DiscountResponse]:
-        """Update a discount."""
         db_discount = db.query(Discount).filter(Discount.id == discount_id).first()
         if not db_discount:
             return None
@@ -1613,11 +2074,10 @@ class PaymentService:
         db.commit()
         db.refresh(db_discount)
         usage_count = db.query(Payment).filter(Payment.discount_id == db_discount.id).count()
-        return DiscountResponse(**db_discount.__dict__, usage_count=usage_count)
+        return DiscountResponse.from_orm(db_discount).copy(update={"usage_count": usage_count})
 
     @staticmethod
     def delete_discount(discount_id: int, db: Session) -> bool:
-        """Delete a discount."""
         db_discount = db.query(Discount).filter(Discount.id == discount_id).first()
         if not db_discount:
             return False
@@ -1626,12 +2086,11 @@ class PaymentService:
         return True
 
     @staticmethod
-    def get_discounts(db: Session) -> list[DiscountResponse]:
-        """Retrieve all discounts."""
+    def get_discounts(db: Session) -> List[DiscountResponse]:
         discounts = db.query(Discount).all()
         return [
-            DiscountResponse(**discount.__dict__, usage_count=db.query(Payment).filter(Payment.discount_id == discount.id).count())
-            for discount in discounts
+            DiscountResponse.from_orm(d).copy(update={"usage_count": db.query(Payment).filter(Payment.discount_id == d.id).count()})
+            for d in discounts
         ]
 
 # py_to_txt.py
@@ -1642,7 +2101,7 @@ import fnmatch
 OUTPUT_FILE = "project_dump.txt"  # итоговый файл
 ROOT_DIR = os.getcwd()  # корень проекта
 IGNORED_DIRS = {".venv", "venv", "__pycache__", ".git"}  # папки для игнора
-IGNORED_FILES = {"*.pyc", "*.pyo", "*.log"}  # маски файлов для игнора
+IGNORED_FILES = {"*.pyc", "*.pyo", "*.log", "*.md", "*.json", "*.txt"}  # маски файлов для игнора
 
 
 def is_empty_init(file_path):
@@ -1698,7 +2157,9 @@ if __name__ == "__main__":
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
+
+from config import settings
 from database import SessionLocal
 from payment.models import Payment
 from payment.services import PaymentService
@@ -1714,14 +2175,17 @@ def check_pending_payments():
         pending_payments = db.query(Payment).filter(Payment.status == "pending").all()
         payment_service = PaymentService()
         for payment in pending_payments:
-            logger.info(f"Checking payment: {payment.payment_id}, expiration_time: {payment.expiration_time}")
-            if payment.expiration_time is None or payment.expiration_time < datetime.utcnow():
+            logger.info(f"Checking payment: {payment.client_payment_id}, expiration_time: {payment.expiration_time}")
+            if payment.expiration_time < datetime.now(timezone.utc).replace(tzinfo=None):
                 payment.status = "expired"
                 db.commit()
-                logger.info(f"Payment {payment.payment_id} marked as expired")
+                logger.info(f"Payment {payment.client_payment_id} marked as expired")
                 continue
             if payment_service.check_payment(payment, db):
-                logger.info(f"Payment {payment.payment_id} confirmed")
+                payment_service.confirm_payment(payment, db)
+                payment.status = "confirmed"
+                db.commit()
+                logger.info(f"Payment {payment.client_payment_id} confirmed")
     except Exception as e:
         logger.error(f"Error in check_pending_payments: {str(e)}")
     finally:
@@ -1729,7 +2193,6 @@ def check_pending_payments():
     logger.info("Finished check_pending_payments task")
 
 def archive_old_posts():
-    """Archive posts older than 1 year."""
     logger.info("Starting archive_old_posts task")
     db: Session = SessionLocal()
     try:
@@ -1745,7 +2208,6 @@ def archive_old_posts():
     logger.info("Finished archive_old_posts task")
 
 def start_scheduler():
-    """Start the background scheduler."""
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_pending_payments, 'interval', minutes=5)
     scheduler.add_job(archive_old_posts, 'interval', days=1)
@@ -1766,9 +2228,10 @@ class Subscription(Base):
     user_id: int = Column(Integer, ForeignKey("users.id"), nullable=False)
     level: str = Column(String, nullable=False)
     expiry_date: datetime = Column(DateTime, nullable=False)
+    payment_id: int = Column(Integer, ForeignKey("payments.id"), nullable=False)  # ← ДОБАВИЛИ (last successful payment)
 
     user = relationship("User", back_populates="subscriptions")
-    payments = relationship("Payment", back_populates="subscription")
+    payment = relationship("Payment")  # ← ДОБАВИЛИ (no back_populates, one-way)
 
 # subscription/routes.py
 # src/subscription/routes.py
@@ -1819,6 +2282,7 @@ class SubscriptionResponse(BaseModel):
     user_id: int
     level: str
     expiry_date: datetime
+    payment_id: int  # ← ДОБАВИЛИ
 
     class Config:
         from_attributes = True
@@ -1831,7 +2295,8 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from subscription.models import Subscription
 from subscription.schemas import SubscriptionCreate, SubscriptionResponse
-from payment.models import Payment, Discount
+from payment.schemas import PaymentCreateResponse
+from payment.models import Discount
 from payment.services import PaymentService
 from auth.models import User
 from config import settings
@@ -1839,13 +2304,12 @@ from config import settings
 class SubscriptionService:
     @staticmethod
     def get_discount(promo_code: Optional[str], db: Session) -> Tuple[Optional[int], float, str]:
-        """Retrieve discount details if valid promo code is provided."""
         if not promo_code:
             return None, 0.0, ""
         discount = db.query(Discount).filter(
             Discount.code == promo_code,
             Discount.is_active == True,
-            Discount.valid_until >= datetime.utcnow()
+            (Discount.valid_until.is_(None) | (Discount.valid_until >= datetime.utcnow()))
         ).first()
         if discount:
             return discount.id, discount.discount_percentage / 100.0, f"Applied promo code {promo_code}, discount {discount.discount_percentage}%"
@@ -1853,12 +2317,11 @@ class SubscriptionService:
 
     @staticmethod
     def create_subscription(
-        subscription_data: SubscriptionCreate,
-        currency: str,
-        user: User,
-        db: Session
-    ) -> dict:
-        """Create or extend a subscription with payment."""
+            subscription_data: SubscriptionCreate,
+            currency: str,
+            user: User,
+            db: Session
+    ) -> PaymentCreateResponse:
         if subscription_data.level not in settings.SUBSCRIPTION_PRICES:
             raise HTTPException(status_code=400, detail="Invalid subscription level")
 
@@ -1866,81 +2329,47 @@ class SubscriptionService:
         dob = user.date_of_birth
         age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
         if age < 18:
-            raise HTTPException(status_code=403, detail="You must be 18 or older to subscribe")
+            raise HTTPException(status_code=403, detail="You must be 18 or older")
 
-        active_subscription = db.query(Subscription).filter(
+        active_sub = db.query(Subscription).filter(
             Subscription.user_id == user.id,
-            Subscription.expiry_date >= datetime.utcnow()
+            Subscription.expiry_date > datetime.utcnow()
         ).first()
 
         base_price = settings.SUBSCRIPTION_PRICES[subscription_data.level]
-        payment_service = PaymentService()
-        unique_amount = payment_service.generate_unique_amount(base_price, db)
 
-        if active_subscription:
-            if active_subscription.level == subscription_data.level:
-                unique_amount = base_price
-            elif settings.SUBSCRIPTION_PRICES[active_subscription.level] > settings.SUBSCRIPTION_PRICES[subscription_data.level]:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"You have an active {active_subscription.level} subscription until {active_subscription.expiry_date}. Downgrading is not allowed."
-                )
+        discount_id, discount_rate, discount_info = SubscriptionService.get_discount(subscription_data.promo_code, db)
+        final_price = base_price * (1 - discount_rate)
+
+        if active_sub:
+            if active_sub.level == subscription_data.level:
+                final_price = base_price
+            elif settings.SUBSCRIPTION_PRICES[active_sub.level] > base_price:
+                raise HTTPException(status_code=400, detail="Downgrade not allowed")
             else:
-                unique_amount = settings.SUBSCRIPTION_PRICES[subscription_data.level] - settings.SUBSCRIPTION_PRICES[active_subscription.level]
+                final_price = base_price - settings.SUBSCRIPTION_PRICES[active_sub.level]
 
-        final_price = int(unique_amount * 100)
-        discount_id, discount, discount_info = SubscriptionService.get_discount(subscription_data.promo_code, db)
-        if discount > 0:
-            final_amount = unique_amount * (1 - discount)
-            final_price = int(final_amount * 100)
-        else:
-            final_amount = unique_amount
+        payment_service = PaymentService()
+        unique_amount = payment_service.generate_unique_amount(final_price, db)
 
-        if active_subscription and active_subscription.level == subscription_data.level:
-            active_subscription.expiry_date = active_subscription.expiry_date + timedelta(days=settings.SUBSCRIPTION_DURATION_DAYS)
-            new_subscription = active_subscription
-        else:
-            expiry_date = datetime.utcnow() + timedelta(days=settings.SUBSCRIPTION_DURATION_DAYS)
-            new_subscription = Subscription(
-                user_id=user.id,
-                level=subscription_data.level,
-                expiry_date=expiry_date
-            )
-            db.add(new_subscription)
-            if active_subscription:
-                active_subscription.expiry_date = datetime.utcnow()
-
-        db.commit()
-        db.refresh(new_subscription)
-
-        expiration_time = datetime.utcnow() + timedelta(minutes=30)
-        new_payment = Payment(
-            subscription_id=new_subscription.id,
-            discount_id=discount_id,
-            payment_method="crypto",
-            payment_id=f"pay_{new_subscription.id}_{datetime.utcnow().timestamp()}",
-            transaction_id=None,
-            amount=final_price,
+        # Создаём Payment через service
+        payment_resp = payment_service.create_payment(
+            user_id=user.id,
+            purpose="subscription",
+            level=subscription_data.level,
+            amount=unique_amount,
             currency=currency,
-            discount_applied=int((unique_amount - final_amount) * 100) if discount_id else 0,
-            status="pending",
-            expiration_time=expiration_time
+            db=db
         )
-        db.add(new_payment)
-        db.commit()
-        db.refresh(new_payment)
 
-        payment_response = payment_service.create_payment(final_amount, currency, db)
-        return {
-            "payment_id": new_payment.payment_id,
-            "payment_url": payment_response["payment_url"],
-            "amount": final_amount,
-            "final_amount": final_amount,
-            "discount_info": discount_info
-        }
+        payment_resp.discount_info = discount_info  # Добавляем, если нужно (расширяем response если discount)
+
+        return payment_resp
 
     @staticmethod
     def get_user_subscriptions(user_id: int, db: Session) -> list[SubscriptionResponse]:
-        """Retrieve all subscriptions for a user."""
-        subscriptions = db.query(Subscription).filter(Subscription.user_id == user_id).all()
-        return [SubscriptionResponse.from_orm(sub) for sub in subscriptions]
+        subs = db.query(Subscription).filter(
+            Subscription.user_id == user_id,
+            Subscription.expiry_date > datetime.utcnow()
+        ).all()
+        return [SubscriptionResponse.from_orm(s) for s in subs]

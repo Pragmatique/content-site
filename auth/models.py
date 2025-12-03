@@ -21,6 +21,7 @@ class User(Base):
     subscriptions = relationship("Subscription", back_populates="user")
     discounts = relationship("Discount", back_populates="user")
     admin_actions = relationship("AdminActionLog", back_populates="admin")
+    payments = relationship("Payment", back_populates="user")
 
 class AdminActionLog(Base):
     """Represents a log of admin actions."""
@@ -32,3 +33,15 @@ class AdminActionLog(Base):
     timestamp: datetime = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     admin = relationship("User", back_populates="admin_actions")
+
+class VerificationToken(Base):
+    """Tokens for email verification and password reset."""
+    __tablename__ = "verification_tokens"
+
+    id: int = Column(Integer, primary_key=True, index=True)
+    user_id: int = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token: str = Column(String, nullable=False, unique=True)
+    token_type: str = Column(String, nullable=False)  # 'verify' or 'reset'
+    expiry: datetime = Column(DateTime, nullable=False)
+
+    user = relationship("User")

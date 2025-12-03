@@ -6,28 +6,40 @@ from typing import Optional
 class PaymentResponse(BaseModel):
     """Schema for payment response."""
     id: int
-    subscription_id: int
+    user_id: int  # ← ДОБАВИЛИ
+    purpose: str  # ← ДОБАВИЛИ
+    level: Optional[str]  # ← ДОБАВИЛИ
     discount_id: Optional[int]
     payment_method: str
-    payment_id: Optional[str]
+    client_payment_id: Optional[str]  # ← ПЕРЕИМЕНОВАЛИ
     transaction_id: Optional[str]
     amount: int
     currency: str
-    payout_currency: Optional[str]
-    discount_applied: int
+    # УБРАЛИ payout_currency, discount_applied
     status: str
     created_at: datetime
+    expiration_time: datetime
 
     class Config:
         from_attributes = True
 
 class PaymentCreateResponse(BaseModel):
     """Schema for payment creation response."""
-    payment_id: str
+    client_payment_id: str  # ← ПЕРЕИМЕНОВАЛИ
     payment_url: str
     amount: float
     final_amount: float
     discount_info: str
+    expires_at: datetime
+    currency: str  # ← ДОБАВИЛИ (для фронта)
+
+class PaymentCheckResponse(BaseModel):
+    status: str
+    amount: float
+    currency: str
+    payment_url: str
+    expires_at: datetime
+    time_left_seconds: int
 
 class DiscountCreate(BaseModel):
     """Schema for creating a discount."""

@@ -1,7 +1,6 @@
 # src/config.py
 from typing import Dict
 
-    
 class Settings:
     """Application configuration settings."""
     DATABASE_URL: str = "postgresql+psycopg2://postgres:1234@localhost:5432/mydb"
@@ -19,13 +18,17 @@ class Settings:
     GCORE_ACCESS_KEY: str = "7HQ7VZOJQXXE1M7NJ6UE"
     GCORE_SECRET_KEY: str = "t4A7iTsstPAlS3rpmdkMXdQbTuVseQVN09Kxuudx"
 
-    # Blockchain settings
-    TRON_FULL_NODE: str = "https://nile.trongrid.io"
+    # Blockchain settings — ТЕСТ
+    TRON_FULL_NODE: str = "https://nile.trongrid.io"  # ТЕСТ
+    # TRON_FULL_NODE: str = "https://api.trongrid.io"  # ПРОДАКШЕН
     TRON_WALLET_ADDRESS: str = "TAVCJF1m5XumpyZLnsUsuSCLrcmdbRA5A2"
     USDT_TRC20_ADDRESS: str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"
-    BSC_FULL_NODE: str = "https://data-seed-prebsc-1-s1.binance.org:8545"
+
+    BSC_FULL_NODE: str = "https://bsc-testnet.publicnode.com"  # Новый public endpoint с лучшими limits; альтернативы: "https://bsc-testnet.drpc.org/", "https://endpoints.omniatech.io/v1/bsc/testnet/public", "https://binance-testnet.rpc.thirdweb.com/"
+    # BSC_FULL_NODE: str = "https://bsc-dataseed.binance.org"  # ПРОДАКШЕН
     BSC_WALLET_ADDRESS: str = "0x83aEb84f08517560dEBFc7F9652d8d260C921561"
     USDT_BEP20_ADDRESS: str = "0x5c24528E2c29988f696dF755C2f9951AC6D67AEF"
+    USDT_BEP20_DECIMALS: int = 18  # Для теста; изменить на 18 для продакшена (стандартный USDT BEP20)
 
     # Subscription settings
     SUBSCRIPTION_PRICES: Dict[str, float] = {
@@ -37,6 +40,14 @@ class Settings:
 
     # Discount settings
     ENABLE_LOYALTY_DISCOUNT: bool = False
+    SMTP_SERVER: str = "smtp.zoho.eu"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = "support@alinanightsky.com"  # Zoho email
+    SMTP_PASSWORD: str = "063783qpL!"  # App password or regular
+    FROM_EMAIL: str = "support@alinanightsky.com"
+
+    BASE_URL: str = "http://localhost:8000"
+    BASE_FRONT_URL: str = "http://localhost:5173"  # Frontend URL for email links, change to prod
 
 
 settings = Settings()
